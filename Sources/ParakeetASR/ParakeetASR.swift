@@ -95,11 +95,13 @@ public class ParakeetASRModel {
         let tMel1 = CFAbsoluteTimeGetCurrent()
 
         // Step 2: Encoder — mel → encoded representations
-        // Pad mel to nearest enumerated shape (EnumeratedShapes avoids BNNS crash)
-        let paddedMel = try padMelToEnumeratedShape(mel: mel, actualLength: melLength)
-        AudioLog.inference.debug("Parakeet: encoding \(melLength) mel frames, padded to \(paddedMel.shape[2])")
+        // Pad / truncate mel to a shape the encoder accepts. `effectiveLength`
+        // is what we mask the encoder with — it equals `melLength` for normal
+        // pad-up cases and the encoder's max for truncated overflows.
+        let (paddedMel, effectiveLength) = try padMelToEnumeratedShape(mel: mel, actualLength: melLength)
+        AudioLog.inference.debug("Parakeet: encoding \(effectiveLength) mel frames, tensor width \(paddedMel.shape[2])")
         let tEnc0 = CFAbsoluteTimeGetCurrent()
-        let encoderOutput = try runEncoder(mel: paddedMel, length: melLength)
+        let encoderOutput = try runEncoder(mel: paddedMel, length: effectiveLength)
         let tEnc1 = CFAbsoluteTimeGetCurrent()
         let encoded = encoderOutput.featureValue(for: "encoded")!.multiArrayValue!
         let encodedLengthArray = encoderOutput.featureValue(for: "encoded_length")!.multiArrayValue!
@@ -131,24 +133,44 @@ public class ParakeetASRModel {
     /// Real values come from `discoverSupportedMelLengths(from:)` at load time.
     private static let defaultMelLengths = [100, 200, 300, 400, 500, 750, 1000, 1500, 2000, 3000]
 
-    /// Pad mel spectrogram to the smallest supported shape that fits.
-    /// Supported shapes are read from the encoder's CoreML input constraint
+    /// Pad / truncate mel spectrogram to the smallest supported shape that
+    /// fits. Supported shapes come from the encoder's CoreML input constraint
     /// at load time (see `discoverSupportedMelLengths(from:)`), so fixed-shape
     /// exports work without forcing the caller to know about them.
-    private func padMelToEnumeratedShape(mel: MLMultiArray, actualLength: Int) throws -> MLMultiArray {
+    ///
+    /// If the mel exceeds the encoder's max supported length, we keep the
+    /// most recent frames (i.e., drop from the start). For voice pipelines
+    /// this preserves the actual speech (which sits at the end of the
+    /// utterance after pre-roll silence) and turns force-cut overflows into
+    /// partial-but-useful transcriptions instead of hard errors.
+    ///
+    /// Returns `(padded, effectiveLength)` because truncation also reduces
+    /// the masked length the encoder uses.
+    private func padMelToEnumeratedShape(
+        mel: MLMultiArray, actualLength: Int
+    ) throws -> (padded: MLMultiArray, length: Int) {
         let melFrames = mel.shape[2].intValue
+        let maxSupported = supportedMelLengths.last ?? 0
+
+        // Truncation path: input exceeds the encoder's max supported size.
+        if melFrames > maxSupported {
+            AudioLog.inference.notice(
+                "Parakeet: mel \(melFrames) > max \(maxSupported); truncating to last \(maxSupported) frames")
+            return try truncateMel(mel: mel, melFrames: melFrames, targetLength: maxSupported)
+        }
 
         // Find the smallest supported length >= melFrames
         guard let targetLength = supportedMelLengths.first(where: { $0 >= melFrames }) else {
-            let maxLen = supportedMelLengths.last ?? 0
-            let maxSecs = Double(maxLen) / 100.0
+            // Should be unreachable given the truncation guard above, but
+            // keep the typed error for any future shape config that breaks
+            // the invariant.
             throw AudioModelError.inferenceFailed(
                 operation: "mel padding",
-                reason: "Audio too long: \(melFrames) mel frames exceeds max \(maxLen) (\(String(format: "%.1f", maxSecs))s) — encoder accepts shapes \(supportedMelLengths)")
+                reason: "No supported shape >= \(melFrames) frames in \(supportedMelLengths)")
         }
 
         if targetLength == melFrames {
-            return mel
+            return (mel, actualLength)
         }
 
         // Create zero-padded mel array [1, 128, targetLength]
@@ -167,7 +189,29 @@ public class ParakeetASRModel {
                 .update(repeating: Float16(0), count: targetLength - melFrames)
         }
 
-        return padded
+        return (padded, actualLength)
+    }
+
+    /// Drop the leading `melFrames - targetLength` frames and copy the tail
+    /// into a `[1, 128, targetLength]` array. Effective length passed to the
+    /// encoder is clamped to `targetLength` so the model's mask covers the
+    /// whole tensor (no zero padding region to ignore).
+    private func truncateMel(
+        mel: MLMultiArray, melFrames: Int, targetLength: Int
+    ) throws -> (padded: MLMultiArray, length: Int) {
+        let dropPrefix = melFrames - targetLength
+        let truncated = try MLMultiArray(
+            shape: [1, 128, targetLength as NSNumber], dataType: mel.dataType)
+        let srcPtr = mel.dataPointer.assumingMemoryBound(to: Float16.self)
+        let dstPtr = truncated.dataPointer.assumingMemoryBound(to: Float16.self)
+        let numMelBins = config.numMelBins
+        for bin in 0..<numMelBins {
+            let srcOffset = bin * melFrames + dropPrefix
+            let dstOffset = bin * targetLength
+            dstPtr.advanced(by: dstOffset)
+                .update(from: srcPtr.advanced(by: srcOffset), count: targetLength)
+        }
+        return (truncated, targetLength)
     }
 
     private func runEncoder(mel: MLMultiArray, length: Int) throws -> MLFeatureProvider {
@@ -266,16 +310,27 @@ public class ParakeetASRModel {
 
         // Step 5: Load CoreML models (encoder, decoder, joint — no preprocessor)
         progressHandler?(0.80, "Loading CoreML models...")
-        // Use cpuAndGPU for encoder — ANE compilation fails on some devices
-        // (iPhone 17 Pro "Unknown aneSubType") causing memory spike + fallback anyway
+        // On real devices and macOS: `cpuAndGPU` for the encoder. ANE
+        // compilation fails on some devices (e.g. iPhone 17 Pro
+        // "Unknown aneSubType") causing memory spike + fallback anyway.
+        // In the iOS Simulator the GPU/MPSGraph backend is unavailable
+        // ("Espresso compiled without MPSGraph engine"); the silent
+        // fallback returns 0 tokens for the INT8-quantized encoder, so
+        // pin to `cpuOnly` which uses the same kernels as the macOS test
+        // path and produces correct results.
+        #if targetEnvironment(simulator)
+        let computeUnits: MLComputeUnits = .cpuOnly
+        #else
+        let computeUnits: MLComputeUnits = .cpuAndGPU
+        #endif
         let encoder = try loadCoreMLModel(
-            name: "encoder", from: resolvedCacheDir, computeUnits: .cpuAndGPU)
+            name: "encoder", from: resolvedCacheDir, computeUnits: computeUnits)
         progressHandler?(0.90, "Loading decoder...")
         let decoder = try loadCoreMLModel(
-            name: "decoder", from: resolvedCacheDir, computeUnits: .cpuAndGPU)
+            name: "decoder", from: resolvedCacheDir, computeUnits: computeUnits)
         progressHandler?(0.95, "Loading joint network...")
         let joint = try loadCoreMLModel(
-            name: "joint", from: resolvedCacheDir, computeUnits: .cpuAndGPU)
+            name: "joint", from: resolvedCacheDir, computeUnits: computeUnits)
 
         let supportedMelLengths = discoverSupportedMelLengths(from: encoder)
         AudioLog.modelLoading.info("Parakeet encoder accepts mel frame counts: \(supportedMelLengths)")
