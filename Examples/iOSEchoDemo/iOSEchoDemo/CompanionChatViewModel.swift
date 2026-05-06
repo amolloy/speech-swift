@@ -107,6 +107,14 @@ final class CompanionChatViewModel {
     private var micRecordBuffer: [Float] = []
     private var ttsRecordBuffer: [Float] = []
     private var debugLog: [String] = []
+    /// Decaying peak amplitude for the simple AGC applied before pushing
+    /// audio to the pipeline. The simulator's host-mic capture varies in
+    /// gain across a session — quiet trailing utterances dropped below
+    /// Silero VAD's onset threshold even at `vadOnset = 0.2`. AGC tracks
+    /// the loudest recent sample (with exponential decay) and scales each
+    /// buffer toward a target peak, capped at 10× to avoid amplifying
+    /// pure silence to noise.
+    private var agcRecentPeak: Float = 0
 
     private func dbg(_ msg: String) {
         let ts = String(format: "%.3f", CFAbsoluteTimeGetCurrent().truncatingRemainder(dividingBy: 1000))
@@ -529,11 +537,14 @@ final class CompanionChatViewModel {
             // cooldown also covers force-cut recovery (its original use).
             let now = CFAbsoluteTimeGetCurrent()
             if self.isGenerating || now < self.pipelineCooldownEnd {
+                // Reset AGC tracker so the first post-cooldown buffer
+                // doesn't inherit a stale peak from before TTS.
+                self.agcRecentPeak = 0
                 let silence = [Float](repeating: 0, count: samples.count)
                 self.pipeline?.pushAudio(silence)
                 return
             }
-            self.pipeline?.pushAudio(samples)
+            self.pipeline?.pushAudio(self.applyAGC(to: samples))
         }
 
         guard let playerFormat = AVAudioFormat(
@@ -549,6 +560,30 @@ final class CompanionChatViewModel {
         } catch {
             errorMessage = "Mic error: \(error.localizedDescription)"
         }
+    }
+
+    /// Per-buffer automatic gain control. Tracks a decaying peak of the
+    /// loudest recent sample and scales the buffer so that peak hits a
+    /// target level (~0.5). Caps at 10× to avoid amplifying silence /
+    /// background noise to speech-trigger levels. The pipeline's silence
+    /// gate ensures this only runs on real mic input (not TTS bleed).
+    private func applyAGC(to samples: [Float]) -> [Float] {
+        let targetPeak: Float = 0.5
+        let decay: Float = 0.95   // peak persists ~ -0.4 dB / buffer
+        let maxGain: Float = 10
+        let minPeakForGain: Float = 0.005   // below this is silence — no gain
+
+        var bufferPeak: Float = 0
+        for s in samples {
+            let abs = s < 0 ? -s : s
+            if abs > bufferPeak { bufferPeak = abs }
+        }
+        agcRecentPeak = max(bufferPeak, agcRecentPeak * decay)
+
+        guard agcRecentPeak > minPeakForGain else { return samples }
+        let gain = min(targetPeak / agcRecentPeak, maxGain)
+        if gain <= 1.05 { return samples }   // already loud enough
+        return samples.map { $0 * gain }
     }
 
     private func stopMicrophone() {
