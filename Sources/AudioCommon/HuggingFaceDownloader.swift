@@ -103,7 +103,13 @@ public enum HuggingFaceDownloader {
         //   old: base/cacheKey         (flat, already has weights — won't reach here)
         //   new: base/models/org/model  (Hub-style)
         // For Hub API we need `base` as downloadBase.
-        let hub = makeHubApi(for: modelId, repoDir: directory)
+        //
+        // Forward `offlineMode` explicitly so HubApi doesn't fall through to
+        // its internal NWPathMonitor auto-detect, which on macOS can briefly
+        // report `.unsatisfied` and then refuse to download (manifesting as
+        // "Offline mode error: No files available locally for this repository"
+        // for a freshly-requested model).
+        let hub = makeHubApi(for: modelId, repoDir: directory, offlineMode: offlineMode)
         let repo = Hub.Repo(id: modelId)
 
         // Retry with exponential backoff — HuggingFace can timeout on
@@ -198,7 +204,11 @@ public enum HuggingFaceDownloader {
 
     /// Create a `HubApi` whose `downloadBase` is derived from the repo directory that
     /// `getCacheDirectory` returned (strips the `models/<org>/<model>` suffix).
-    private static func makeHubApi(for modelId: String, repoDir: URL) -> HubApi {
+    ///
+    /// `offlineMode` is forwarded as `useOfflineMode` so callers get the mode
+    /// they asked for instead of relying on `NWPathMonitor` auto-detection,
+    /// which can spuriously report `.unsatisfied` on macOS.
+    private static func makeHubApi(for modelId: String, repoDir: URL, offlineMode: Bool) -> HubApi {
         // repoDir is  base/models/org/model
         // We need     base
         let repo = Hub.Repo(id: modelId)
@@ -213,6 +223,6 @@ public enum HuggingFaceDownloader {
             // Hub won't match this path, so we derive base from env/defaults.
             downloadBase = resolveBaseCacheDir(cacheDirName: repoDir.deletingLastPathComponent().lastPathComponent)
         }
-        return HubApi(downloadBase: downloadBase)
+        return HubApi(downloadBase: downloadBase, useOfflineMode: offlineMode)
     }
 }
