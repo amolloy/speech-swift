@@ -40,14 +40,21 @@ jobs:
         with:
           files: dist/speech-macos-arm64.tar.gz
 
-      - name: Update Homebrew formula
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          if [ -z "${HOMEBREW_TAP_TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN secret is not set — skipping tap bump. Users on soniqo/tap won't pick up this release automatically." >&2
+            exit 0
+          fi
+
           SHA=$(shasum -a 256 dist/speech-macos-arm64.tar.gz | awk '{print $1}')
           TAG="${GITHUB_REF_NAME}"
           URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/speech-macos-arm64.tar.gz"
 
-          git fetch origin main
-          git checkout main
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/soniqo/homebrew-tap.git" /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
 
           sed -i '' "s|url \".*\"|url \"${URL}\"|" Formula/speech.rb
           sed -i '' "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/speech.rb
@@ -55,5 +62,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/speech.rb
-          git diff --cached --quiet || git commit -m "brew: update formula for ${TAG}"
+          git diff --cached --quiet || git commit -m "speech: update to ${TAG}"
           git push origin main
