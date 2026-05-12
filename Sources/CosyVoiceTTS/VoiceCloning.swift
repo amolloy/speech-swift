@@ -158,23 +158,125 @@ extension CosyVoiceTTSModel {
     }
 
     /// Convenience: synthesize with a `CosyVoiceVoiceProfile` directly.
+    ///
+    /// For long inputs (>~12 s of expected audio) the LLM autoregressively
+    /// drifts past its training distribution — voice identity oscillates and
+    /// content goes to gibberish. This method splits long text on sentence
+    /// boundaries, synthesises each chunk against the same `voiceProfile`,
+    /// and stitches the audio back together with a short silence gap. Each
+    /// segment stays inside the model's reliable window so voice identity
+    /// stays consistent throughout.
     public func synthesize(
         text: String,
         voiceProfile: CosyVoiceVoiceProfile,
         language: String = "english",
         instruction: String = "You are a helpful assistant.",
+        segmentGapSeconds: Float = 0.2,
         verbose: Bool = false
     ) -> [Float] {
-        synthesize(
-            text: text,
-            language: language,
-            instruction: instruction,
-            speakerEmbedding: voiceProfile.speakerEmbedding,
-            promptToken: voiceProfile.promptToken,
-            promptFeat: voiceProfile.promptFeat,
-            promptText: voiceProfile.promptText,
-            verbose: verbose
+        let segments = Self.splitForLongForm(text)
+        if segments.count <= 1 {
+            return synthesize(
+                text: text,
+                language: language,
+                instruction: instruction,
+                speakerEmbedding: voiceProfile.speakerEmbedding,
+                promptToken: voiceProfile.promptToken,
+                promptFeat: voiceProfile.promptFeat,
+                promptText: voiceProfile.promptText,
+                verbose: verbose
+            )
+        }
+
+        let gap = [Float](
+            repeating: 0,
+            count: Int(segmentGapSeconds * Float(config.sampleRate))
         )
+        var output: [Float] = []
+        for (i, seg) in segments.enumerated() {
+            if verbose {
+                print("  Long-form segment \(i + 1)/\(segments.count): \"\(seg)\"")
+            }
+            let samples = synthesize(
+                text: seg,
+                language: language,
+                instruction: instruction,
+                speakerEmbedding: voiceProfile.speakerEmbedding,
+                promptToken: voiceProfile.promptToken,
+                promptFeat: voiceProfile.promptFeat,
+                promptText: voiceProfile.promptText,
+                verbose: verbose
+            )
+            if !output.isEmpty && !samples.isEmpty {
+                output.append(contentsOf: gap)
+            }
+            output.append(contentsOf: samples)
+        }
+        return output
+    }
+
+    /// Split text into segments small enough that the LLM stays inside its
+    /// reliable autoregressive window. Splits on sentence-terminating
+    /// punctuation, then further splits any segment longer than ~25 words
+    /// at clause boundaries (commas/semicolons). Sequential short fragments
+    /// are merged so we don't synthesise a 2-word segment unnecessarily.
+    static func splitForLongForm(_ text: String) -> [String] {
+        let maxWordsPerSegment = 25
+        let minWordsPerSegment = 4
+
+        // Split on . ! ? while keeping the punctuation attached.
+        let sentenceTerminators: Set<Character> = [".", "!", "?"]
+        var sentences: [String] = []
+        var current = ""
+        for ch in text {
+            current.append(ch)
+            if sentenceTerminators.contains(ch) {
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { sentences.append(trimmed) }
+                current = ""
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { sentences.append(tail) }
+        if sentences.isEmpty { return [text] }
+
+        // Further split overly long sentences on clause boundaries.
+        var segments: [String] = []
+        for s in sentences {
+            let wordCount = s.split(whereSeparator: { $0.isWhitespace }).count
+            if wordCount <= maxWordsPerSegment {
+                segments.append(s)
+            } else {
+                let clauseSeparators: Set<Character> = [",", ";", ":"]
+                var clauses: [String] = []
+                var buf = ""
+                for ch in s {
+                    buf.append(ch)
+                    if clauseSeparators.contains(ch) {
+                        let t = buf.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !t.isEmpty { clauses.append(t) }
+                        buf = ""
+                    }
+                }
+                let last = buf.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !last.isEmpty { clauses.append(last) }
+                segments.append(contentsOf: clauses)
+            }
+        }
+
+        // Merge short fragments forward so we don't emit 2-word segments.
+        var merged: [String] = []
+        for s in segments {
+            let wc = s.split(whereSeparator: { $0.isWhitespace }).count
+            if let last = merged.last,
+               last.split(whereSeparator: { $0.isWhitespace }).count < minWordsPerSegment,
+               (last.split(whereSeparator: { $0.isWhitespace }).count + wc) <= maxWordsPerSegment {
+                merged[merged.count - 1] = last + " " + s
+            } else {
+                merged.append(s)
+            }
+        }
+        return merged
     }
 }
 

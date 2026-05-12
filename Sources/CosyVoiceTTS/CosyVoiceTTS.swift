@@ -216,12 +216,18 @@ public final class CosyVoiceTTSModel {
         let promptSpeechTokensArr: [Int32]? = promptToken.map { pt in
             pt.reshaped(-1).asArray(Int32.self)
         }
+        // Cap maxTokens proportionally to the content length. With prompt
+        // conditioning the LLM is biased to "keep speaking" — a fixed cap of
+        // 500 lets a 5-word phrase generate 20 s of repeats. Scale to 10×
+        // content_tokens (with a sensible floor for very short content). This
+        // mirrors upstream's `max_len = content_text_len * max_token_text_ratio`.
+        let scaledMaxTokens = max(200, contentTokens.count * 10)
         var t0 = CFAbsoluteTimeGetCurrent()
         let speechTokens = llm.generate(
             textTokens: textTokens,
             promptSpeechTokens: promptSpeechTokensArr,
             contentTextLength: contentTokens.count,
-            maxTokens: 500  // ~20 seconds of audio at 25 Hz
+            maxTokens: scaledMaxTokens
         )
         if verbose {
             let llmTime = CFAbsoluteTimeGetCurrent() - t0
