@@ -224,11 +224,14 @@ extension CosyVoiceTTSModel {
         let maxWordsPerSegment = 25
         let minWordsPerSegment = 4
 
+        let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return [] }
+
         // Split on . ! ? while keeping the punctuation attached.
         let sentenceTerminators: Set<Character> = [".", "!", "?"]
         var sentences: [String] = []
         var current = ""
-        for ch in text {
+        for ch in input {
             current.append(ch)
             if sentenceTerminators.contains(ch) {
                 let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -238,7 +241,7 @@ extension CosyVoiceTTSModel {
         }
         let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
         if !tail.isEmpty { sentences.append(tail) }
-        if sentences.isEmpty { return [text] }
+        if sentences.isEmpty { return [input] }
 
         // Further split overly long sentences on clause boundaries.
         var segments: [String] = []
