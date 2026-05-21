@@ -1,5 +1,6 @@
 #if canImport(AVFoundation)
 import AVFoundation
+import CoreAudio
 import os
 
 /// Lock-free SPSC ring buffer for audio samples.
@@ -400,10 +401,10 @@ public final class StreamingAudioPlayer: @unchecked Sendable {
         let node = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList -> OSStatus in
             guard let self else { return noErr }
 
-            let ablPointer = UnsafeMutableAudioBufferListPointer(bufferList)
-            guard let dst = ablPointer[0].mData?.assumingMemoryBound(to: Float.self) else {
+                        guard let mData = bufferList.pointee.mBuffers.mData else {
                 return noErr
             }
+            let dst = mData.assumingMemoryBound(to: Float.self)
             let frames = Int(frameCount)
 
             self.lock.lock()
